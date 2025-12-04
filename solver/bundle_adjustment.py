@@ -1,7 +1,10 @@
 """
 Bundle Adjustment für Shadow Geolocation
 
-VERSION 2.0:
+VERSION 2.1:
+- KORRIGIERT: Dynamische Bounds (max ±50% vom Initialwert)
+- KORRIGIERT: Stärkere Regularization gegen Skalierungs-Drift
+- KORRIGIERT: Normalisierter Error relativ zur Raumgröße
 - Echtes FOV statt master_focal_length
 - Koordinatensystem mit Ursprung bei (0, 0, 0)
 - Globale Kamera-Position (nicht pro Screenshot)
@@ -179,6 +182,10 @@ def compute_projection_error(
     """
     Berechne den Projektions-Fehler.
     
+    VERSION 2.1 - KORRIGIERT:
+    - Stärkere Regularization gegen Skalierungs-Drift
+    - Normalisierter Error
+    
     Error-Signal:
     1. backgroundOffset != (50, 50) bedeutet:
        - Die projizierten Raum-Linien passen nicht zum Screenshot
@@ -186,6 +193,7 @@ def compute_projection_error(
     
     2. Regularization:
        - Abweichung von initialen Werten (gewichtet nach Confidence)
+       - STARK gewichtet um Drift zu verhindern
     
     Args:
         params: [room_width, room_depth, room_height, cam_x, cam_y, cam_z]
@@ -202,7 +210,9 @@ def compute_projection_error(
     room_width, room_depth, room_height = params[0:3]
     cam_x, cam_y, cam_z = params[3:6]
     
-    # Reprojection Error
+    # =========================================================================
+    # REPROJECTION ERROR
+    # =========================================================================
     reprojection_error = 0.0
     screenshot_count = 0
     
@@ -220,47 +230,70 @@ def compute_projection_error(
             fov_y=fov_y
         )
         
-        # Error: Wie weit ist die Projektion vom aktuellen Offset entfernt?
-        # Wenn Offset = (50, 50) und Projektion = (50, 50) → Error = 0
-        # Wenn Offset = (60, 40) und Projektion = (50, 50) → Error groß
-        
-        # Das Offset zeigt, wohin der User den Screenshot verschieben musste
-        # Die Projektion zeigt, wo das Raum-Zentrum erscheinen würde
-        
-        # Ideal: projected == offset (User musste nicht verschieben)
-        # Real: Differenz zwischen "wo das Zentrum projiziert wird" und "wo der User es hingeschoben hat"
-        
+        # Error: Wie weit ist die Projektion vom User-Offset entfernt?
         offset_error_x = screenshot.background_offset_x - projected_x
         offset_error_y = screenshot.background_offset_y - projected_y
         
         reprojection_error += offset_error_x**2 + offset_error_y**2
     
-    # Normalisieren
+    # Normalisieren auf Anzahl Screenshots
     if screenshot_count > 0:
         reprojection_error /= screenshot_count
     
-    # Regularization: Wie weit weichen wir vom Initial Guess ab?
+    # =========================================================================
+    # REGULARIZATION - STARK gegen Skalierungs-Drift
+    # =========================================================================
     
-    # Raum: Normalisiert auf Prozent-Abweichung
+    # Berechne RELATIVE Abweichung (in Prozent)
+    # z.B. wenn initial_width=5m und aktuell=7.5m → 50% Abweichung
+    
+    room_width_deviation = (room_width - initial_room['width']) / initial_room['width']
+    room_depth_deviation = (room_depth - initial_room['depth']) / initial_room['depth']
+    room_height_deviation = (room_height - initial_room['height']) / initial_room['height']
+    
+    # Quadratische Penalty für Abweichung
     room_deviation = (
-        ((room_width - initial_room['width']) / max(initial_room['width'], 0.1))**2 +
-        ((room_depth - initial_room['depth']) / max(initial_room['depth'], 0.1))**2 +
-        ((room_height - initial_room['height']) / max(initial_room['height'], 0.1))**2
+        room_width_deviation**2 +
+        room_depth_deviation**2 +
+        room_height_deviation**2
     )
     
-    # Position: Normalisiert auf Raum-Dimensionen
+    # Position: Relativ zur initialen Raumgröße
+    cam_x_deviation = (cam_x - initial_camera['x']) / initial_room['width']
+    cam_y_deviation = (cam_y - initial_camera['y']) / initial_room['height']
+    cam_z_deviation = (cam_z - initial_camera['z']) / initial_room['depth']
+    
     position_deviation = (
-        ((cam_x - initial_camera['x']) / max(initial_room['width'], 0.1))**2 +
-        ((cam_y - initial_camera['y']) / max(initial_room['height'], 0.1))**2 +
-        ((cam_z - initial_camera['z']) / max(initial_room['depth'], 0.1))**2
+        cam_x_deviation**2 +
+        cam_y_deviation**2 +
+        cam_z_deviation**2
     )
     
-    # Gewichte: Hohe Confidence = starke Regularization
-    # (User ist sicher → Parameter soll nicht zu weit abweichen)
-    room_weight = weights.get('room_confidence', 0.5) * 10
-    position_weight = weights.get('position_confidence', 0.5) * 10
+    # =========================================================================
+    # GEWICHTUNG - Angepasst!
+    # =========================================================================
     
-    # Gewichtete Summe
+    # room_confidence: 0 = "bin mir unsicher, darf stark variieren"
+    #                  1 = "bin mir sehr sicher, kaum Variation erlaubt"
+    #
+    # ABER: Wir brauchen IMMER eine Basis-Regularization, sonst driftet es!
+    
+    room_confidence = weights.get('room_confidence', 0.5)
+    position_confidence = weights.get('position_confidence', 0.5)
+    
+    # Basis-Gewicht (immer vorhanden!) + zusätzliches Confidence-Gewicht
+    # Bei confidence=0: base_weight = 50 (verhindert extremen Drift)
+    # Bei confidence=1: base_weight = 50 + 200 = 250 (sehr starke Regularization)
+    base_room_weight = 50.0
+    base_position_weight = 20.0
+    
+    room_weight = base_room_weight + room_confidence * 200.0
+    position_weight = base_position_weight + position_confidence * 100.0
+    
+    # =========================================================================
+    # GESAMTER ERROR
+    # =========================================================================
+    
     total_error = (
         reprojection_error +
         room_weight * room_deviation +
@@ -277,7 +310,9 @@ async def bundle_adjustment_async(
     """
     Führe Bundle Adjustment durch mit Progress-Updates.
     
-    VERSION 2.0:
+    VERSION 2.1:
+    - KORRIGIERT: Dynamische Bounds (max ±50% vom Initialwert)
+    - KORRIGIERT: Stärkere Regularization gegen Skalierungs-Drift
     - Optimiert Raum-Dimensionen und globale Kamera-Position
     - Verwendet echtes FOV (nicht master_focal_length)
     - Error-Signal: backgroundOffset != (50, 50)
@@ -296,7 +331,7 @@ async def bundle_adjustment_async(
         yield {
             "type": "progress",
             "progress": 0,
-            "message": "Starte Bundle Adjustment (v2.0)...",
+            "message": "Starte Bundle Adjustment (v2.1)...",
             "iteration": 0
         }
         
@@ -317,7 +352,7 @@ async def bundle_adjustment_async(
         initial_camera = calibration_data.camera_position
         fov_y = calibration_data.fov_y
         
-        print(f"📐 Bundle Adjustment v2.0")
+        print(f"📐 Bundle Adjustment v2.1")
         print(f"   Raum: {room['width']:.1f} x {room['depth']:.1f} x {room['height']:.1f}m")
         print(f"   Kamera: ({initial_camera['x']:.2f}, {initial_camera['y']:.2f}, {initial_camera['z']:.2f})")
         print(f"   FOV: {fov_y}°")
@@ -343,15 +378,53 @@ async def bundle_adjustment_async(
             initial_camera['z']
         ])
         
-        # Bounds (physikalisch plausibel)
+        # =====================================================================
+        # DYNAMISCHE BOUNDS - Verhindert Drift!
+        # =====================================================================
+        # Erlaube maximal ±50% Abweichung vom Initialwert
+        # Bei confidence=1 (sehr sicher): nur ±20% erlaubt
+        # Bei confidence=0 (unsicher): ±50% erlaubt
+        
+        room_confidence = weights.get('room_confidence', 0.5)
+        position_confidence = weights.get('position_confidence', 0.5)
+        
+        # Max erlaubte relative Abweichung
+        room_max_deviation = 0.5 - room_confidence * 0.3  # 0.5 → 0.2
+        pos_max_deviation = 0.5 - position_confidence * 0.3
+        
         bounds = [
-            (2.0, 20.0),   # Raum-Breite: 2-20m
-            (2.0, 20.0),   # Raum-Tiefe: 2-20m
-            (2.0, 6.0),    # Raum-Höhe: 2-6m
-            (0.1, room['width'] - 0.1),   # Kamera X: innerhalb Raum
-            (0.1, room['height'] - 0.1),  # Kamera Y: innerhalb Raum
-            (0.1, room['depth'] - 0.1)    # Kamera Z: innerhalb Raum
+            # Raum-Dimensionen: ±max_deviation vom Initialwert, aber mind. 2m
+            (
+                max(2.0, room['width'] * (1 - room_max_deviation)),
+                room['width'] * (1 + room_max_deviation)
+            ),
+            (
+                max(2.0, room['depth'] * (1 - room_max_deviation)),
+                room['depth'] * (1 + room_max_deviation)
+            ),
+            (
+                max(2.0, room['height'] * (1 - room_max_deviation)),
+                min(6.0, room['height'] * (1 + room_max_deviation))  # Max 6m Höhe
+            ),
+            # Kamera-Position: Innerhalb des Raums, aber mit etwas Spielraum
+            (
+                max(0.1, initial_camera['x'] - room['width'] * pos_max_deviation),
+                min(room['width'] - 0.1, initial_camera['x'] + room['width'] * pos_max_deviation)
+            ),
+            (
+                max(0.1, initial_camera['y'] - room['height'] * pos_max_deviation),
+                min(room['height'] - 0.1, initial_camera['y'] + room['height'] * pos_max_deviation)
+            ),
+            (
+                max(0.1, initial_camera['z'] - room['depth'] * pos_max_deviation),
+                min(room['depth'] - 0.1, initial_camera['z'] + room['depth'] * pos_max_deviation)
+            )
         ]
+        
+        print(f"   Bounds (room_max_dev={room_max_deviation:.0%}):")
+        print(f"     Width: {bounds[0][0]:.2f} - {bounds[0][1]:.2f}m")
+        print(f"     Depth: {bounds[1][0]:.2f} - {bounds[1][1]:.2f}m")
+        print(f"     Height: {bounds[2][0]:.2f} - {bounds[2][1]:.2f}m")
         
         # Iterations-Zähler
         iteration_count = [0]
@@ -424,10 +497,14 @@ async def bundle_adjustment_async(
             avg_offset_error += abs(s.background_offset_x - proj_x) + abs(s.background_offset_y - proj_y)
         avg_offset_error /= len(completed_screenshots)
         
+        # Zeige Änderungen
         print(f"✅ Optimierung abgeschlossen:")
         print(f"   Error: {initial_error:.4f} → {final_error:.4f} ({improvement_percent:.1f}%)")
-        print(f"   Raum: {optimized_room['width']:.2f} x {optimized_room['depth']:.2f} x {optimized_room['height']:.2f}m")
-        print(f"   Kamera: ({optimized_camera['x']:.2f}, {optimized_camera['y']:.2f}, {optimized_camera['z']:.2f})")
+        print(f"   Raum: {room['width']:.2f} → {optimized_room['width']:.2f}m (Δ={optimized_room['width']-room['width']:+.2f})")
+        print(f"         {room['depth']:.2f} → {optimized_room['depth']:.2f}m (Δ={optimized_room['depth']-room['depth']:+.2f})")
+        print(f"         {room['height']:.2f} → {optimized_room['height']:.2f}m (Δ={optimized_room['height']-room['height']:+.2f})")
+        print(f"   Kamera: ({initial_camera['x']:.2f}, {initial_camera['y']:.2f}, {initial_camera['z']:.2f})")
+        print(f"        → ({optimized_camera['x']:.2f}, {optimized_camera['y']:.2f}, {optimized_camera['z']:.2f})")
         print(f"   Avg Offset Error: {avg_offset_error:.1f}%")
         
         yield {
