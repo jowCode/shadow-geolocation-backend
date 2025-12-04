@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 import uuid
 
-# Importiere die neuen Models und Bundle Adjustment
+# Importiere Models (liegt im Root)
 from models import (
     SessionCreate, SessionResponse, SolveRequest,
     BundleAdjustmentRequest, CalibrationScreenshotData
 )
-from bundle_adjustment import (
+
+# Importiere Bundle Adjustment aus solver/ Unterordner
+from solver.bundle_adjustment import (
     bundle_adjustment_async, CalibrationData, CalibrationScreenshot,
     convert_legacy_request
 )
