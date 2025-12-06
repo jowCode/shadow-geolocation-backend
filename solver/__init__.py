@@ -1,17 +1,9 @@
 """
-Solver-Module für Shadow Geolocation
+Solver-Module für Shadow Geolocation (v3.0)
 """
 
-from .bundle_adjustment import (
-    bundle_adjustment_async,
-    CalibrationData,
-    CalibrationScreenshot,
-    convert_legacy_request
-)
+from .bundle_adjustment import bundle_adjustment_async
 
 __all__ = [
-    'bundle_adjustment_async',
-    'CalibrationData',
-    'CalibrationScreenshot',
-    'convert_legacy_request'
+    'bundle_adjustment_async'
 ]
