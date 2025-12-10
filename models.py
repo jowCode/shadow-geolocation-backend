@@ -25,8 +25,8 @@ class Point3D(BaseModel):
 
 class NormalizedPoint2D(BaseModel):
     """Normalisierter 2D-Punkt (0-1)"""
-    normalizedX: float = Field(ge=0, le=1)
-    normalizedY: float = Field(ge=0, le=1)
+    normalizedX: float
+    normalizedY: float
 
 
 class Dimensions(BaseModel):
@@ -117,8 +117,8 @@ WallName = Literal["back", "left", "right", "front", "floor"]
 
 class ShadowPoint(BaseModel):
     """Schatten-Punkt mit Wand-Information"""
-    normalizedX: float = Field(ge=0, le=1)
-    normalizedY: float = Field(ge=0, le=1)
+    normalizedX: float
+    normalizedY: float
     wall: WallName
     world3D: Optional[Point3D] = None  # Optional, für Debug
 
