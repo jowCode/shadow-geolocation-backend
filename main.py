@@ -5,12 +5,14 @@ VERSION 3.0:
 - Zentrale session.json (alle Daten in einer Datei)
 - Vereinfachte API (4 Endpoints statt 8+)
 - Kein Legacy v1/v2 Support
+- NEU: Validation Endpoints
 """
 
 from fastapi import FastAPI, WebSocket, UploadFile, File, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from typing import Optional
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel
 import json
 from pathlib import Path
 import uuid
@@ -24,6 +26,12 @@ from models import (
 )
 
 from solver.bundle_adjustment import bundle_adjustment_async
+from solver.validation import (
+    validate_object as validate_object_func,
+    validate_inter_object as validate_inter_object_func,
+    validate_screenshot as validate_screenshot_func,
+    validate_all as validate_all_func
+)
 
 # FastAPI App
 app = FastAPI(
@@ -271,6 +279,234 @@ async def get_screenshot(session_id: str, filename: str):
         raise HTTPException(status_code=404, detail="Screenshot nicht gefunden")
     
     return FileResponse(file_path, media_type="image/png")
+
+
+# ============================================================================
+# VALIDATION ENDPOINTS (NEU)
+# ============================================================================
+
+class ValidateObjectRequest(BaseModel):
+    """Request für Einzelobjekt-Validierung"""
+    screenshotId: str
+    objectId: str
+
+
+class ValidateInterObjectRequest(BaseModel):
+    """Request für Inter-Objekt-Validierung"""
+    screenshotId: str
+
+
+class ValidationResponse(BaseModel):
+    """Allgemeine Validierungs-Response"""
+    success: bool
+    status: str
+    message: str
+    data: Optional[Dict[str, Any]] = None
+
+
+def find_screenshot_data(session_data: dict, screenshot_id: str) -> Optional[dict]:
+    """Findet Schatten-Daten für einen Screenshot"""
+    shadows = session_data.get('shadows', [])
+    for s in shadows:
+        if s.get('screenshotId') == screenshot_id:
+            return s
+    return None
+
+
+def find_object_data(screenshot_data: dict, object_id: str) -> Optional[dict]:
+    """Findet ein Objekt in den Screenshot-Daten"""
+    for obj in screenshot_data.get('objects', []):
+        if obj.get('id') == object_id:
+            return obj
+    return None
+
+
+def find_screenshot_calibration(session_data: dict, screenshot_id: str) -> Optional[dict]:
+    """Findet die Kalibrierung für einen Screenshot"""
+    calibration = session_data.get('calibration')
+    if not calibration:
+        return None
+    
+    for sc in calibration.get('screenshots', []):
+        if sc.get('screenshotId') == screenshot_id:
+            return sc
+    return None
+
+
+@app.post("/api/sessions/{session_id}/validate/object", response_model=ValidationResponse)
+async def validate_object(session_id: str, request: ValidateObjectRequest):
+    """
+    Validiert ein einzelnes Objekt (Intra-Objekt-Konsistenz).
+    
+    Prüft ob die 3 Punkt-Paare des Objekts konsistent sind,
+    d.h. ob sie alle auf dieselbe Lichtrichtung zeigen.
+    """
+    session = load_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session nicht gefunden")
+    
+    session_data = session.model_dump()
+    
+    # Finde Screenshot-Daten
+    screenshot_data = find_screenshot_data(session_data, request.screenshotId)
+    if not screenshot_data:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Screenshot {request.screenshotId} nicht in Schatten-Daten gefunden"
+        )
+    
+    # Finde Objekt
+    obj = find_object_data(screenshot_data, request.objectId)
+    if not obj:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Objekt {request.objectId} nicht gefunden"
+        )
+    
+    # Finde Kalibrierung
+    screenshot_calib = find_screenshot_calibration(session_data, request.screenshotId)
+    if not screenshot_calib:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Keine Kalibrierung für Screenshot {request.screenshotId}"
+        )
+    
+    calibration = session_data.get('calibration', {})
+    room = calibration.get('room', {})
+    camera_pos = calibration.get('camera', {}).get('position', {})
+    camera_rot = screenshot_calib.get('cameraRotation', {})
+    fov_y = calibration.get('camera', {}).get('fovY', 60)
+    
+    print(f"🔍 Validiere Objekt {request.objectId} in Screenshot {request.screenshotId}")
+    
+    # Validierung durchführen
+    result = validate_object_func(
+        obj.get('pairs', []),
+        camera_pos,
+        camera_rot,
+        fov_y,
+        room
+    )
+    
+    print(f"   Status: {result.status}, Score: {result.consistency_score:.1f}%")
+    
+    return ValidationResponse(
+        success=result.success,
+        status=result.status,
+        message=result.message,
+        data={
+            'objectId': request.objectId,
+            'screenshotId': request.screenshotId,
+            'consistencyScore': result.consistency_score,
+            'lightDirection': {
+                'x': result.light_direction.x,
+                'y': result.light_direction.y,
+                'z': result.light_direction.z
+            } if result.light_direction else None,
+            'averageErrorDeg': result.average_error_deg,
+            'maxErrorDeg': result.max_error_deg,
+            'details': result.details
+        }
+    )
+
+
+@app.post("/api/sessions/{session_id}/validate/inter-object", response_model=ValidationResponse)
+async def validate_inter_object(session_id: str, request: ValidateInterObjectRequest):
+    """
+    Validiert Inter-Objekt-Konsistenz für einen Screenshot.
+    
+    Prüft ob alle Objekte in einem Screenshot auf dieselbe
+    Lichtquelle (Sonnenrichtung) zeigen.
+    """
+    session = load_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session nicht gefunden")
+    
+    session_data = session.model_dump()
+    
+    # Finde Screenshot-Daten
+    screenshot_data = find_screenshot_data(session_data, request.screenshotId)
+    if not screenshot_data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Screenshot {request.screenshotId} nicht in Schatten-Daten gefunden"
+        )
+    
+    # Finde Kalibrierung
+    screenshot_calib = find_screenshot_calibration(session_data, request.screenshotId)
+    if not screenshot_calib:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Keine Kalibrierung für Screenshot {request.screenshotId}"
+        )
+    
+    calibration = session_data.get('calibration', {})
+    room = calibration.get('room', {})
+    camera_pos = calibration.get('camera', {}).get('position', {})
+    camera_rot = screenshot_calib.get('cameraRotation', {})
+    fov_y = calibration.get('camera', {}).get('fovY', 60)
+    
+    print(f"🔍 Validiere Inter-Objekt für Screenshot {request.screenshotId}")
+    
+    # Validierung durchführen
+    result = validate_inter_object_func(
+        screenshot_data.get('objects', []),
+        camera_pos,
+        camera_rot,
+        fov_y,
+        room
+    )
+    
+    print(f"   Status: {result.get('status')}, Score: {result.get('inter_object_score', 0):.1f}%")
+    
+    return ValidationResponse(
+        success=result.get('success', False),
+        status=result.get('status', 'error'),
+        message=result.get('message', ''),
+        data={
+            'screenshotId': request.screenshotId,
+            'interObjectScore': result.get('inter_object_score', 0),
+            'averageDeviationDeg': result.get('average_deviation_deg', 0),
+            'maxDeviationDeg': result.get('max_deviation_deg', 0),
+            'meanLightDirection': result.get('mean_light_direction'),
+            'meanLightAzimuthDeg': result.get('mean_light_azimuth_deg'),
+            'meanLightElevationDeg': result.get('mean_light_elevation_deg'),
+            'objectResults': result.get('object_results', [])
+        }
+    )
+
+
+@app.post("/api/sessions/{session_id}/validate/all", response_model=ValidationResponse)
+async def validate_all(session_id: str):
+    """
+    Validiert alle Daten einer Session.
+    
+    Führt Intra-Objekt, Inter-Objekt und Cross-Screenshot-Validierung durch.
+    """
+    session = load_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session nicht gefunden")
+    
+    session_data = session.model_dump()
+    
+    print(f"🔍 Validiere gesamte Session {session_id}")
+    
+    # Validierung durchführen
+    result = validate_all_func(session_data)
+    
+    print(f"   Status: {result.get('status')}, Global Score: {result.get('global_score', 0):.1f}%")
+    
+    return ValidationResponse(
+        success=result.get('success', False),
+        status=result.get('status', 'error'),
+        message=result.get('message', ''),
+        data={
+            'globalScore': result.get('global_score', 0),
+            'summary': result.get('summary', {}),
+            'screenshotResults': result.get('screenshot_results', []),
+            'crossScreenshotConsistency': result.get('cross_screenshot_consistency', {})
+        }
+    )
 
 
 # ============================================================================
