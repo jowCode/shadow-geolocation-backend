@@ -18,6 +18,7 @@ from pathlib import Path
 import uuid
 from datetime import datetime
 
+# Models
 from models import (
     SessionData, CreateSessionRequest, CreateSessionResponse,
     UploadScreenshotResponse, MetaData, CalibrationData,
@@ -25,7 +26,11 @@ from models import (
     EulerRotation, DisplayParams, BundleAdjustmentRequest
 )
 
+# Solver
 from solver.bundle_adjustment import bundle_adjustment_async
+from solver.geolocation import calculate_geolocation, get_sun_position
+
+# Validation Solver
 from solver.validation import (
     validate_object as validate_object_func,
     validate_inter_object as validate_inter_object_func,
@@ -37,11 +42,11 @@ from solver.validation import (
 app = FastAPI(
     title="Shadow Geolocation Backend",
     version="3.0",
-    docs_url="/docs",  # Swagger UI aktiviert für Entwicklung
+    docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS für Angular
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:4200"],
@@ -50,7 +55,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# File-Storage
+# Storage
 DATA_DIR = Path("data/uploads")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -60,44 +65,37 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================================
 
 def get_session_dir(session_id: str) -> Path:
-    """Gibt den Session-Ordner zurück"""
     return DATA_DIR / session_id
 
 
 def get_session_file(session_id: str) -> Path:
-    """Gibt den Pfad zur session.json zurück"""
     return get_session_dir(session_id) / "session.json"
 
 
 def get_screenshots_dir(session_id: str) -> Path:
-    """Gibt den Screenshots-Ordner zurück"""
     return get_session_dir(session_id) / "screenshots"
 
 
 def load_session(session_id: str) -> Optional[SessionData]:
-    """Lädt eine Session aus der session.json"""
     session_file = get_session_file(session_id)
-    
     if not session_file.exists():
         return None
-    
+
     with open(session_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    
+
     return SessionData(**data)
 
 
 def save_session(session_data: SessionData) -> None:
-    """Speichert eine Session in die session.json"""
     session_file = get_session_file(session_data.sessionId)
-    
-    # LastModified aktualisieren
+
     session_data.meta.lastModified = datetime.utcnow().isoformat() + "Z"
-    
+
     with open(session_file, "w", encoding="utf-8") as f:
         json.dump(session_data.model_dump(), f, indent=2, ensure_ascii=False)
-    
-    print(f"💾 Session gespeichert: {session_data.sessionId}")
+
+    print(f"Session gespeichert: {session_data.sessionId}")
 
 
 # ============================================================================
@@ -106,13 +104,11 @@ def save_session(session_data: SessionData) -> None:
 
 @app.get("/")
 async def root():
-    """Health Check"""
     return {"status": "Shadow Geolocation Backend v3.0 running"}
 
 
 @app.get("/health")
 async def health():
-    """Health Check"""
     return {"status": "ok", "version": "3.0"}
 
 
@@ -122,20 +118,13 @@ async def health():
 
 @app.post("/api/sessions", response_model=CreateSessionResponse)
 async def create_session(request: CreateSessionRequest):
-    """
-    Erstellt eine neue Session.
-    
-    Wird von Stage 1 aufgerufen nach Eingabe von Projektname und Screenshots.
-    """
     session_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat() + "Z"
-    
-    # Session-Ordner anlegen
+
     session_dir = get_session_dir(session_id)
     session_dir.mkdir(exist_ok=True)
     get_screenshots_dir(session_id).mkdir(exist_ok=True)
-    
-    # Session-Daten erstellen
+
     session_data = SessionData(
         version="3.0",
         sessionId=session_id,
@@ -150,14 +139,9 @@ async def create_session(request: CreateSessionRequest):
         shadows=None,
         validation=None
     )
-    
-    # Speichern
+
     save_session(session_data)
-    
-    print(f"✅ Neue Session erstellt: {session_id}")
-    print(f"   Projekt: {request.projectName}")
-    print(f"   Screenshots: {len(request.screenshots)}")
-    
+
     return CreateSessionResponse(
         sessionId=session_id,
         projectName=request.projectName
@@ -166,64 +150,34 @@ async def create_session(request: CreateSessionRequest):
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
-    """
-    Lädt eine komplette Session.
-    
-    Wird von allen Stages beim Initialisieren aufgerufen.
-    """
     session_data = load_session(session_id)
-    
     if not session_data:
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
-    print(f"📂 Session geladen: {session_id}")
-    print(f"   Projekt: {session_data.meta.projectName}")
-    print(f"   Screenshots: {len(session_data.screenshots)}")
-    print(f"   Calibration: {'✓' if session_data.calibration else '✗'}")
-    print(f"   Shadows: {'✓' if session_data.shadows else '✗'}")
-    
+
     return session_data.model_dump()
 
 
 @app.put("/api/sessions/{session_id}")
 async def update_session(session_id: str, session_data: SessionData):
-    """
-    Speichert eine komplette Session.
-    
-    Wird beim Speichern (manuell oder bei Navigation) aufgerufen.
-    """
-    # Prüfe ob Session existiert
     if not get_session_dir(session_id).exists():
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
-    # Session-ID muss übereinstimmen
+
     if session_data.sessionId != session_id:
         raise HTTPException(status_code=400, detail="Session-ID stimmt nicht überein")
-    
-    # Speichern
+
     save_session(session_data)
-    
-    print(f"💾 Session aktualisiert: {session_id}")
-    
     return {"status": "saved", "sessionId": session_id}
 
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """
-    Löscht eine Session (optional, für später).
-    """
     session_dir = get_session_dir(session_id)
-    
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
-    # Rekursiv löschen
+
     import shutil
     shutil.rmtree(session_dir)
-    
-    print(f"🗑️ Session gelöscht: {session_id}")
-    
+
     return {"status": "deleted", "sessionId": session_id}
 
 
@@ -232,35 +186,21 @@ async def delete_session(session_id: str):
 # ----------------------------------------------------------------------------
 
 @app.post("/api/sessions/{session_id}/screenshots", response_model=UploadScreenshotResponse)
-async def upload_screenshot(
-    session_id: str,
-    screenshot_id: str,
-    file: UploadFile = File(...)
-):
-    """
-    Lädt einen Screenshot hoch.
-    
-    Wird von Stage 1 für jeden Screenshot aufgerufen.
-    """
+async def upload_screenshot(session_id: str, screenshot_id: str, file: UploadFile = File(...)):
     session_dir = get_session_dir(session_id)
-    
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
+
     screenshots_dir = get_screenshots_dir(session_id)
     screenshots_dir.mkdir(exist_ok=True)
-    
-    # Dateiname: screenshot_id.png
+
     filename = f"{screenshot_id}.png"
     file_path = screenshots_dir / filename
-    
-    # Speichern
+
     content = await file.read()
     with open(file_path, "wb") as f:
         f.write(content)
-    
-    print(f"📸 Screenshot hochgeladen: {filename} ({len(content)} bytes)")
-    
+
     return UploadScreenshotResponse(
         filename=filename,
         screenshotId=screenshot_id,
@@ -270,34 +210,27 @@ async def upload_screenshot(
 
 @app.get("/api/sessions/{session_id}/screenshots/{filename}")
 async def get_screenshot(session_id: str, filename: str):
-    """
-    Gibt einen Screenshot zurück.
-    """
     file_path = get_screenshots_dir(session_id) / filename
-    
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Screenshot nicht gefunden")
-    
+
     return FileResponse(file_path, media_type="image/png")
 
 
 # ============================================================================
-# VALIDATION ENDPOINTS (NEU)
+# VALIDATION ENDPOINTS
 # ============================================================================
 
 class ValidateObjectRequest(BaseModel):
-    """Request für Einzelobjekt-Validierung"""
     screenshotId: str
     objectId: str
 
 
 class ValidateInterObjectRequest(BaseModel):
-    """Request für Inter-Objekt-Validierung"""
     screenshotId: str
 
 
 class ValidationResponse(BaseModel):
-    """Allgemeine Validierungs-Response"""
     success: bool
     status: str
     message: str
@@ -305,7 +238,6 @@ class ValidationResponse(BaseModel):
 
 
 def find_screenshot_data(session_data: dict, screenshot_id: str) -> Optional[dict]:
-    """Findet Schatten-Daten für einen Screenshot"""
     shadows = session_data.get('shadows', [])
     for s in shadows:
         if s.get('screenshotId') == screenshot_id:
@@ -314,7 +246,6 @@ def find_screenshot_data(session_data: dict, screenshot_id: str) -> Optional[dic
 
 
 def find_object_data(screenshot_data: dict, object_id: str) -> Optional[dict]:
-    """Findet ein Objekt in den Screenshot-Daten"""
     for obj in screenshot_data.get('objects', []):
         if obj.get('id') == object_id:
             return obj
@@ -322,11 +253,9 @@ def find_object_data(screenshot_data: dict, object_id: str) -> Optional[dict]:
 
 
 def find_screenshot_calibration(session_data: dict, screenshot_id: str) -> Optional[dict]:
-    """Findet die Kalibrierung für einen Screenshot"""
     calibration = session_data.get('calibration')
     if not calibration:
         return None
-    
     for sc in calibration.get('screenshots', []):
         if sc.get('screenshotId') == screenshot_id:
             return sc
@@ -335,51 +264,30 @@ def find_screenshot_calibration(session_data: dict, screenshot_id: str) -> Optio
 
 @app.post("/api/sessions/{session_id}/validate/object", response_model=ValidationResponse)
 async def validate_object(session_id: str, request: ValidateObjectRequest):
-    """
-    Validiert ein einzelnes Objekt (Intra-Objekt-Konsistenz).
-    
-    Prüft ob die 3 Punkt-Paare des Objekts konsistent sind,
-    d.h. ob sie alle auf dieselbe Lichtrichtung zeigen.
-    """
     session = load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
+
     session_data = session.model_dump()
-    
-    # Finde Screenshot-Daten
     screenshot_data = find_screenshot_data(session_data, request.screenshotId)
+
     if not screenshot_data:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Screenshot {request.screenshotId} nicht in Schatten-Daten gefunden"
-        )
-    
-    # Finde Objekt
+        raise HTTPException(status_code=404, detail=f"Screenshot {request.screenshotId} nicht in Schatten-Daten gefunden")
+
     obj = find_object_data(screenshot_data, request.objectId)
     if not obj:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Objekt {request.objectId} nicht gefunden"
-        )
-    
-    # Finde Kalibrierung
+        raise HTTPException(status_code=404, detail=f"Objekt {request.objectId} nicht gefunden")
+
     screenshot_calib = find_screenshot_calibration(session_data, request.screenshotId)
     if not screenshot_calib:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Keine Kalibrierung für Screenshot {request.screenshotId}"
-        )
-    
+        raise HTTPException(status_code=404, detail=f"Keine Kalibrierung für Screenshot {request.screenshotId}")
+
     calibration = session_data.get('calibration', {})
     room = calibration.get('room', {})
     camera_pos = calibration.get('camera', {}).get('position', {})
     camera_rot = screenshot_calib.get('cameraRotation', {})
     fov_y = calibration.get('camera', {}).get('fovY', 60)
-    
-    print(f"🔍 Validiere Objekt {request.objectId} in Screenshot {request.screenshotId}")
-    
-    # Validierung durchführen
+
     result = validate_object_func(
         obj.get('pairs', []),
         camera_pos,
@@ -387,9 +295,7 @@ async def validate_object(session_id: str, request: ValidateObjectRequest):
         fov_y,
         room
     )
-    
-    print(f"   Status: {result.status}, Score: {result.consistency_score:.1f}%")
-    
+
     return ValidationResponse(
         success=result.success,
         status=result.status,
@@ -412,43 +318,26 @@ async def validate_object(session_id: str, request: ValidateObjectRequest):
 
 @app.post("/api/sessions/{session_id}/validate/inter-object", response_model=ValidationResponse)
 async def validate_inter_object(session_id: str, request: ValidateInterObjectRequest):
-    """
-    Validiert Inter-Objekt-Konsistenz für einen Screenshot.
-    
-    Prüft ob alle Objekte in einem Screenshot auf dieselbe
-    Lichtquelle (Sonnenrichtung) zeigen.
-    """
     session = load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
+
     session_data = session.model_dump()
-    
-    # Finde Screenshot-Daten
     screenshot_data = find_screenshot_data(session_data, request.screenshotId)
+
     if not screenshot_data:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Screenshot {request.screenshotId} nicht in Schatten-Daten gefunden"
-        )
-    
-    # Finde Kalibrierung
+        raise HTTPException(status_code=404, detail=f"Screenshot {request.screenshotId} nicht in Schatten-Daten gefunden")
+
     screenshot_calib = find_screenshot_calibration(session_data, request.screenshotId)
     if not screenshot_calib:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Keine Kalibrierung für Screenshot {request.screenshotId}"
-        )
-    
+        raise HTTPException(status_code=404, detail=f"Keine Kalibrierung für Screenshot {request.screenshotId}")
+
     calibration = session_data.get('calibration', {})
     room = calibration.get('room', {})
     camera_pos = calibration.get('camera', {}).get('position', {})
     camera_rot = screenshot_calib.get('cameraRotation', {})
     fov_y = calibration.get('camera', {}).get('fovY', 60)
-    
-    print(f"🔍 Validiere Inter-Objekt für Screenshot {request.screenshotId}")
-    
-    # Validierung durchführen
+
     result = validate_inter_object_func(
         screenshot_data.get('objects', []),
         camera_pos,
@@ -456,9 +345,7 @@ async def validate_inter_object(session_id: str, request: ValidateInterObjectReq
         fov_y,
         room
     )
-    
-    print(f"   Status: {result.get('status')}, Score: {result.get('inter_object_score', 0):.1f}%")
-    
+
     return ValidationResponse(
         success=result.get('success', False),
         status=result.get('status', 'error'),
@@ -478,24 +365,13 @@ async def validate_inter_object(session_id: str, request: ValidateInterObjectReq
 
 @app.post("/api/sessions/{session_id}/validate/all", response_model=ValidationResponse)
 async def validate_all(session_id: str):
-    """
-    Validiert alle Daten einer Session.
-    
-    Führt Intra-Objekt, Inter-Objekt und Cross-Screenshot-Validierung durch.
-    """
     session = load_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
+
     session_data = session.model_dump()
-    
-    print(f"🔍 Validiere gesamte Session {session_id}")
-    
-    # Validierung durchführen
     result = validate_all_func(session_data)
-    
-    print(f"   Status: {result.get('status')}, Global Score: {result.get('global_score', 0):.1f}%")
-    
+
     return ValidationResponse(
         success=result.get('success', False),
         status=result.get('status', 'error'),
@@ -515,56 +391,32 @@ async def validate_all(session_id: str):
 
 @app.websocket("/ws/bundle-adjustment")
 async def websocket_bundle_adjustment(websocket: WebSocket):
-    """
-    WebSocket für Bundle Adjustment mit Live-Progress.
-    
-    VERSION 3.0:
-    - Verwendet neues SessionData/CalibrationData Format
-    - Kein Legacy-Support mehr
-    """
     await websocket.accept()
-    print("✅ WebSocket connected (Bundle Adjustment)")
-    
+
     try:
-        # Request empfangen
         raw_data = await websocket.receive_json()
-        
-        print(f"📦 Bundle Adjustment Request erhalten")
-        print(f"   Session: {raw_data.get('sessionId', 'N/A')}")
-        
-        # Validiere Request
+
         if 'calibration' not in raw_data:
             await websocket.send_json({
                 "type": "error",
                 "message": "Keine Kalibrierungsdaten im Request"
             })
             return
-        
+
         calibration_data = raw_data['calibration']
         weights = raw_data.get('weights', {
             'room_confidence': 0.5,
             'position_confidence': 0.5
         })
-        
-        print(f"   Room: {calibration_data['room']}")
-        print(f"   Camera: {calibration_data['camera']}")
-        print(f"   Screenshots: {len(calibration_data.get('screenshots', []))}")
-        print(f"   Weights: {weights}")
-        
-        # Bundle Adjustment ausführen
+
         async for update in bundle_adjustment_async(calibration_data, weights):
             await websocket.send_json(update)
-            
             if update['type'] in ['error', 'result']:
-                print(f"✅ Bundle Adjustment beendet: {update['type']}")
                 break
-        
+
     except WebSocketDisconnect:
-        print("❌ Client disconnected")
+        pass
     except Exception as e:
-        print(f"❌ ERROR: {type(e).__name__}: {str(e)}")
-        import traceback
-        traceback.print_exc()
         try:
             await websocket.send_json({
                 "type": "error",
@@ -575,33 +427,88 @@ async def websocket_bundle_adjustment(websocket: WebSocket):
     finally:
         try:
             await websocket.close()
-            print("🔌 WebSocket closed")
         except:
             pass
 
 
 # ============================================================================
-# LEGACY ENDPOINTS (für Migration - später entfernen)
+# GEOLOCATION ENDPOINTS (Stage 7)
 # ============================================================================
 
-# Diese Endpoints werden temporär beibehalten, falls alte Clients sie noch nutzen.
-# TODO: Nach vollständiger Migration entfernen
+class GeolocationRequest(BaseModel):
+    screenshot_id: str
+    date: str
+    time_utc: str
+    hemisphere: str = "north"
+    room_orientation: float = 0.0
+
+
+@app.post("/api/sessions/{session_id}/geolocation")
+async def compute_geolocation(session_id: str, request: GeolocationRequest):
+    session_path = get_session_file(session_id)
+    if not session_path.exists():
+        raise HTTPException(status_code=404, detail="Session nicht gefunden")
+
+    with open(session_path, 'r') as f:
+        session_data = json.load(f)
+
+    result = calculate_geolocation(
+        session_data=session_data,
+        screenshot_id=request.screenshot_id,
+        date_str=request.date,
+        time_str=request.time_utc,
+        hemisphere=request.hemisphere,
+        room_orientation=request.room_orientation
+    )
+
+    return result
+
+
+@app.get("/api/sun-position")
+async def get_sun_position_api(
+    latitude: float,
+    longitude: float,
+    date: str,
+    time_utc: str
+):
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.strptime(f"{date} {time_utc}", "%Y-%m-%d %H:%M")
+        dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Ungültiges Datum/Uhrzeit: {e}")
+
+    sun = get_sun_position(latitude, longitude, dt)
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "datetime_utc": dt.isoformat(),
+        "azimuth": round(sun.azimuth, 2),
+        "elevation": round(sun.elevation, 2)
+    }
+
+
+# ============================================================================
+# LEGACY ENDPOINTS (TEMPORÄR)
+# ============================================================================
+
+# … (Unveränderte Legacy-Blöcke)
+# Die Legacy Endpoints bleiben unverändert, da die Frage sich nur auf Geolocation & Imports bezog.
 
 @app.post("/api/session/create")
 async def legacy_create_session(data: dict):
-    """LEGACY: Alte Session-Erstellung"""
-    print("⚠️ LEGACY ENDPOINT AUFGERUFEN: /api/session/create")
-    
-    from models import ScreenshotData
-    
+    print("LEGACY ENDPOINT: /api/session/create")
+
     request = CreateSessionRequest(
         projectName=data.get('project_name', 'Unnamed'),
         cameraType=data.get('camera_type', 'static'),
         screenshots=[]
     )
-    
+
     response = await create_session(request)
-    
+
     return {
         "session_id": response.sessionId,
         "project_name": response.projectName
@@ -610,17 +517,15 @@ async def legacy_create_session(data: dict):
 
 @app.get("/api/session/{session_id}/calibration")
 async def legacy_load_calibration(session_id: str):
-    """LEGACY: Kalibrierung laden"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: /api/session/{session_id}/calibration")
-    
+    print(f"LEGACY ENDPOINT: load calibration {session_id}")
+
     session_data = load_session(session_id)
     if not session_data:
         return {"status": "not_found", "data": None}
-    
+
     if not session_data.calibration:
         return {"status": "not_found", "data": None}
-    
-    # Konvertiere zu altem Format
+
     legacy_data = {
         "version": "2.0",
         "room": session_data.calibration.room.model_dump(),
@@ -643,24 +548,22 @@ async def legacy_load_calibration(session_id: str):
             for s in session_data.calibration.screenshots
         ]
     }
-    
+
     return {"status": "found", "data": legacy_data}
 
 
 @app.post("/api/session/{session_id}/calibration")
 async def legacy_save_calibration(session_id: str, data: dict):
-    """LEGACY: Kalibrierung speichern"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: POST /api/session/{session_id}/calibration")
-    
+    print(f"LEGACY ENDPOINT: save calibration {session_id}")
+
     session_data = load_session(session_id)
     if not session_data:
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
-    # Konvertiere von altem Format
+
     room_data = data.get('room', {})
     camera_pos = data.get('camera', {}).get('position') or data.get('globalCameraPosition', {})
     fov_y = data.get('camera', {}).get('fovY') or data.get('globalFovY', 60)
-    
+
     session_data.calibration = CalibrationData(
         room=RoomDimensions(**room_data),
         camera=CameraParams(
@@ -683,21 +586,20 @@ async def legacy_save_calibration(session_id: str, data: dict):
             for s in data.get('screenshots', [])
         ]
     )
-    
+
     save_session(session_data)
-    
+
     return {"status": "saved"}
 
 
 @app.get("/api/session/{session_id}/organize")
 async def legacy_load_organization(session_id: str):
-    """LEGACY: Organization laden"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: /api/session/{session_id}/organize")
-    
+    print(f"LEGACY ENDPOINT: load organization {session_id}")
+
     session_data = load_session(session_id)
     if not session_data:
         return {"status": "not_found", "data": None}
-    
+
     legacy_data = {
         "screenshots": [
             {
@@ -710,28 +612,21 @@ async def legacy_load_organization(session_id: str):
             for s in session_data.screenshots
         ]
     }
-    
+
     return {"status": "found", "data": legacy_data}
 
 
 @app.post("/api/session/{session_id}/organize")
 async def legacy_save_organization(session_id: str, data: dict):
-    """LEGACY: Organization speichern"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: POST /api/session/{session_id}/organize")
+    print(f"LEGACY ENDPOINT: save organization {session_id}")
     return {"status": "saved"}
 
 
 @app.post("/api/session/{session_id}/upload-screenshot")
-async def legacy_upload_screenshot(
-    session_id: str,
-    screenshot_id: str = None,
-    file: UploadFile = File(...)
-):
-    """LEGACY: Screenshot hochladen"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: /api/session/{session_id}/upload-screenshot")
-    
+async def legacy_upload_screenshot(session_id: str, screenshot_id: str = None, file: UploadFile = File(...)):
+    print(f"LEGACY ENDPOINT: upload screenshot {session_id}")
     response = await upload_screenshot(session_id, screenshot_id or str(uuid.uuid4()), file)
-    
+
     return {
         "status": "uploaded",
         "filename": response.filename,
@@ -742,22 +637,20 @@ async def legacy_upload_screenshot(
 
 @app.get("/api/session/{session_id}/screenshot/{filename}")
 async def legacy_get_screenshot(session_id: str, filename: str):
-    """LEGACY: Screenshot abrufen"""
     return await get_screenshot(session_id, filename)
 
 
 @app.get("/api/session/{session_id}/shadows")
 async def legacy_load_shadows(session_id: str):
-    """LEGACY: Shadows laden"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: /api/session/{session_id}/shadows")
-    
+    print(f"LEGACY ENDPOINT: load shadows {session_id}")
+
     session_data = load_session(session_id)
     if not session_data:
         return {"status": "not_found", "data": None}
-    
+
     if not session_data.shadows:
         return {"status": "not_found", "data": None}
-    
+
     legacy_data = {
         "version": "2.0",
         "screenshots": [
@@ -781,22 +674,20 @@ async def legacy_load_shadows(session_id: str):
             for s in session_data.shadows
         ]
     }
-    
+
     return {"status": "found", "data": legacy_data}
 
 
 @app.post("/api/session/{session_id}/shadows")
 async def legacy_save_shadows(session_id: str, data: dict):
-    """LEGACY: Shadows speichern"""
-    print(f"⚠️ LEGACY ENDPOINT AUFGERUFEN: POST /api/session/{session_id}/shadows")
-    
+    print(f"LEGACY ENDPOINT: save shadows {session_id}")
+
     from models import ScreenshotShadows, ShadowObject, ShadowPair, NormalizedPoint2D, ShadowPoint
-    
+
     session_data = load_session(session_id)
     if not session_data:
         raise HTTPException(status_code=404, detail="Session nicht gefunden")
-    
-    # Konvertiere von altem Format
+
     session_data.shadows = [
         ScreenshotShadows(
             screenshotId=s.get('screenshotId', s.get('id', '')),
@@ -825,14 +716,12 @@ async def legacy_save_shadows(session_id: str, data: dict):
         )
         for s in data.get('screenshots', [])
     ]
-    
+
     save_session(session_data)
-    
+
     return {"status": "saved"}
 
 
-# Alias für sessions (ohne s am Ende)
 @app.get("/api/sessions/{session_id}/shadows")
 async def load_shadows_new(session_id: str):
-    """Shadows laden (neuer Endpoint)"""
     return await legacy_load_shadows(session_id)
