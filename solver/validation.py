@@ -457,13 +457,19 @@ def validate_object(
         )
         object_rays.append(ray)
         
-        # Schatten-3D-Punkt
-        shadow_3d = project_shadow_to_3d(
-            shadow['normalizedX'], shadow['normalizedY'],
-            shadow['wall'],
-            camera_position, camera_rotation,
-            fov_y, room, aspect_ratio
-        )
+        # Schatten-3D-Punkt - verwende vorberechnete world3D wenn vorhanden
+        if 'world3D' in shadow and shadow['world3D']:
+            # Frontend hat bereits korrekte 3D-Koordinaten berechnet
+            w3d = shadow['world3D']
+            shadow_3d = np.array([w3d['x'], w3d['y'], w3d['z']])
+        else:
+            # Fallback: projiziere auf Wand (kann bei Koordinaten-Diskrepanzen fehlschlagen)
+            shadow_3d = project_shadow_to_3d(
+                shadow['normalizedX'], shadow['normalizedY'],
+                shadow['wall'],
+                camera_position, camera_rotation,
+                fov_y, room, aspect_ratio
+            )
         
         if shadow_3d is None:
             return ValidationResult(
